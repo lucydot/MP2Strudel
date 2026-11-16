@@ -1,0 +1,42 @@
+[
+ {
+  "file": "C_mp66_element_300K.json",
+  "mp_id": "mp-66",
+  "temperature": 300,
+  "projection": "element",
+  "labels": [
+   "C"
+  ]
+ },
+ {
+  "file": "C_mp66_element_athermal.json",
+  "mp_id": "mp-66",
+  "temperature": null,
+  "projection": "element",
+  "labels": [
+   "C"
+  ]
+ },
+ {
+  "file": "CaCO3_mp3953_element_300K.json",
+  "mp_id": "mp-3953",
+  "temperature": 300,
+  "projection": "element",
+  "labels": [
+   "Ca",
+   "C",
+   "O"
+  ]
+ },
+ {
+  "file": "CaCO3_mp3953_element_athermal.json",
+  "mp_id": "mp-3953",
+  "temperature": null,
+  "projection": "element",
+  "labels": [
+   "Ca",
+   "C",
+   "O"
+  ]
+ }
+]
