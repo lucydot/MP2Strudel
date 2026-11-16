@@ -18,6 +18,15 @@
   ]
  },
  {
+  "file": "C_mp66_element_600K.json",
+  "mp_id": "mp-66",
+  "temperature": 600,
+  "projection": "element",
+  "labels": [
+   "C"
+  ]
+ },
+ {
   "file": "C_mp66_element_athermal.json",
   "mp_id": "mp-66",
   "temperature": null,
