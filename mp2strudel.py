@@ -29,19 +29,26 @@ Options:
     --png            also save a plot of each fit to plots/<same name>.png (committed with the data)
     --no-push        write the files but skip git
     --copy           also copy the Strudel block to the clipboard (macOS pbcopy)
+    --no-open        don't open the Strudel link in the browser (it is never opened with --no-push)
+
+The Strudel code and a strudel.cc link that opens it are also written to strudel.js (overwritten each run).
 """
 
 import argparse
+import base64
 import json
 import re
 import subprocess
+import webbrowser
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 from singingmaterials import frequency_mapping, mp_interface, peak_fitting
 
 DATA_DIR = Path("data")
 PLOT_DIR = Path("plots")
+STRUDEL_FILE = Path("strudel.js")  # latest Strudel code and link; overwritten each run
 DEFAULT_OCTAVES_DOWN = frequency_mapping.DEFAULT_OCTAVES_DOWN
 DEFAULT_PITCH_MAP = (  # (THz, Hz): 1 THz sounds at 116.4 Hz
     1.0,
@@ -76,11 +83,11 @@ def settings_for_material(setting, labels):
         return setting
 
 
-def pitch_warnings(peaks):
+def pitch_warnings(fits, peaks):
     """one line per peak whose audible pitch is outside the comfortable range, or outside range of typical human hearing."""
     lines = []
     for label, v in peaks.items():
-        for f, a in zip(v["frequency"], v["audible"]):
+        for f, a in zip(fits[label]["centres"], v["freq"]):
             if AUDIBLE_RANGE[0] <= a <= AUDIBLE_RANGE[1]:
                 if COMFORTABLE_RANGE[0] <= a <= COMFORTABLE_RANGE[1]:
                     continue
@@ -104,28 +111,27 @@ def peaks_to_json(fits, pitch_map=DEFAULT_PITCH_MAP):
     DOS ratios are relative to the tallest peak across all labels, as in peak_fitting.save_peak_fit."""
     all_dos = np.concatenate([f["dos"] for f in fits.values()])
     ref_dos = np.max(all_dos) if len(all_dos) else 1.0
-    dos_sum = np.sum(all_dos / ref_dos) if len(all_dos) else 1.0
 
     def r(values, n=6):
         return [float(round(float(v), n)) for v in values]
 
+    def to_audible(
+        values,
+    ):  # same scaling for centres and widths, so a peak keeps its shape in pitch
+        return r(
+            frequency_mapping.phonon_to_audible_scaled(
+                values, pitch_map[0] * 1e12, pitch_map[1]
+            ),
+            2,
+        )
+
     out = {}
     for label, f in fits.items():
         out[label] = {
-            "n": len(f["centres"]),
-            "frequency": [float(c) for c in f["centres"]],  # Hz
-            "fwhm": [float(w) for w in f["fwhms"]],  # Hz
-            "dos": r(f["dos"]),
-            "dos_ratio": r(f["dos"] / ref_dos, 4),  # dos / tallest peak
-            "norm_dos_ratio": r(
-                f["dos"] / ref_dos / dos_sum, 4
-            ),  # sums to 1 over all labels
-            "audible": r(
-                frequency_mapping.phonon_to_audible_scaled(
-                    f["centres"], pitch_map[0] * 1e12, pitch_map[1]
-                ),
-                2,
-            ),  # Hz, frequency scaled down by the pitch map (ratios kept)
+            # short names, for use in Strudel
+            "freq": to_audible(f["centres"]),  # Hz, audible pitch of each peak
+            "width": to_audible(f["fwhms"]),  # Hz, audible FWHM (same scaling as freq)
+            "D": r(f["dos"] / ref_dos, 4),  # DOS / tallest peak's DOS (0-1)
         }
     return out
 
@@ -178,25 +184,14 @@ def export_material(
             smoothing=smoothing_m,
             min_frequency=min_frequency,
         )
-        payload = {
-            "mp_id": mp_id,
-            "formula": formula,
-            "temperature": temp,
-            "projection": projection,
-            "settings": {
-                "n_peaks": n_peaks_m,
-                "smoothing_THz": smoothing_m,
-                "min_frequency_THz": min_frequency,
-                "pitch_map": {"THz": pitch_map[0], "Hz": pitch_map[1]},
-                "octaves_down": octaves_down,  # None when --pitch-map was used
-            },
-            "peaks": peaks_to_json(fits, pitch_map),
-        }
+        # the JSON holds only the peaks, {label: {freq, width, D}}; the metadata goes in
+        # data/index.json and in the comments of the Strudel code
+        peaks = peaks_to_json(fits, pitch_map)
         path = DATA_DIR / f"{export_name(mp_id, formula, projection, temp)}.json"
-        path.write_text(json.dumps(payload, indent=1, ensure_ascii=False))
-        counts = ", ".join(f"{k}:{v['n']}" for k, v in payload["peaks"].items())
+        path.write_text(json.dumps(peaks, indent=1, ensure_ascii=False))
+        counts = ", ".join(f"{k}:{len(v['freq'])}" for k, v in peaks.items())
         print(f"wrote {path}  (peaks {counts})")
-        warnings = pitch_warnings(payload["peaks"])
+        warnings = pitch_warnings(fits, peaks)
         if warnings:
             print(
                 f"  warning: {len(warnings)} peak(s) outside comfortable hearing "
@@ -216,6 +211,13 @@ def export_material(
         "formula": formula,
         "labels": labels,
         "projection": projection,
+        "settings": {
+            "n_peaks": n_peaks_m,
+            "smoothing_THz": smoothing_m,
+            "min_frequency_THz": min_frequency,
+            "pitch_map": {"THz": pitch_map[0], "Hz": pitch_map[1]},
+            "octaves_down": octaves_down,  # None when --pitch-map was used
+        },
         "files": files,
         "plots": plots,
     }
@@ -248,27 +250,90 @@ def commit_and_push(paths, message):
     return git("rev-parse", "HEAD")
 
 
+def short_names(materials):
+    """short JS names for each (file, label) pair, e.g. C, or C_300K / CaCO3_C_300K when needed to keep
+    them unique. Every name uses the same level of detail, so the block reads consistently."""
+    entries = [
+        (m, temp, path, lab)
+        for m in materials
+        for temp, path in m["files"].items()
+        for lab in m["labels"]
+    ]
+    levels = [
+        lambda m, temp, lab: lab,
+        lambda m, temp, lab: f"{lab}_{temp_tag(temp)}",
+        lambda m, temp, lab: f"{m['formula']}_{lab}_{temp_tag(temp)}",
+        lambda m, temp, lab: (
+            f"{m['formula']}_{m['mp_id'].replace('-', '')}_{lab}_{temp_tag(temp)}"
+        ),
+    ]
+    for level in levels:
+        names = [level(m, temp, lab) for m, temp, _, lab in entries]
+        if len(set(names)) == len(names):
+            break
+    return [(name, path, lab) for name, (_, _, path, lab) in zip(names, entries)]
+
+
+def describe_setting(setting):
+    """9 -> '9';  {'Ca': 6, 'C': 4} -> 'Ca=6 C=4'"""
+    if isinstance(setting, dict):
+        return " ".join(f"{k}={v:g}" for k, v in setting.items())
+    return f"{setting:g}"
+
+
+def describe_temp(temp):
+    return "athermal" if temp is None else f"{temp:g} K"
+
+
 def strudel_block(materials, base_url, label):
+    settings = materials[0][
+        "settings"
+    ]  # pitch settings are the same for every material in a run
+    if settings["octaves_down"] is not None:
+        pitch = f"phonon frequencies transposed down {settings['octaves_down']} octaves"
+    else:
+        pm = settings["pitch_map"]
+        pitch = f"phonon frequencies scaled so {pm['THz']:g} THz -> {pm['Hz']:g} Hz"
     lines = [
         f"// Singing Materials phonon peaks · {label}",
+        f"// pitch: {pitch} (ratios kept)",
         "const load = f => fetch('" + base_url + "' + f).then(r => r.json())",
     ]
     for m in materials:
-        lines.append("")
-        lines.append(
-            f"// {m['formula']} ({m['mp_id']}) · {m['projection']} peaks: {', '.join(m['labels'])}"
-        )
-        for _, path in m["files"].items():
-            lines.append(f"const {path.stem} = await load('{path.name}')")
-    first = materials[0]
-    ex = f"{next(iter(first['files'].values())).stem}.peaks.{first['labels'][0]}"
+        st = m["settings"]
+        lines += [
+            "",
+            f"// {m['formula']} ({m['mp_id']}) · {m['projection']} projection · "
+            f"peaks: {', '.join(m['labels'])}",
+            f"// fit: n_peaks {describe_setting(st['n_peaks'])}, "
+            f"smoothing {describe_setting(st['smoothing_THz'])} THz, "
+            f"min frequency {st['min_frequency_THz']:g} THz",
+        ]
+        for temp, path in m["files"].items():
+            lines.append(
+                f"const {path.stem} = await load('{path.name}')  // {describe_temp(temp)}"
+            )
+
+    shorts = short_names(materials)
+    lines += ["", "// shortcuts to each set of peaks"]
+    lines += [f"const {name} = {path.stem}.{lab}" for name, path, lab in shorts]
+
+    ex = shorts[0][0]
     lines += [
         "",
-        f"// {ex}.frequency   peak centres (Hz)    .fwhm  widths (Hz)",
-        f"// {ex}.audible     peak centres scaled to audible pitches (Hz)",
-        f"// {ex}.dos_ratio   dos / tallest peak    .modes  modes per peak",
+        "// each shortcut holds one list entry per peak (lowest frequency first):",
+        f"//   {ex}.freq    audible pitch of each peak (Hz)",
+        f"//   {ex}.width   audible peak width, FWHM (Hz)",
+        f"//   {ex}.D       peak DOS / tallest peak's DOS (0-1)",
     ]
     return "\n".join(lines)
+
+
+def strudel_url(code):
+    """a strudel.cc link that opens with `code` in the editor. Strudel reads the code from the URL hash as
+    encodeURIComponent(base64(UTF-8 code)); see code2hash in Strudel's packages/core/util.mjs."""
+    encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    return "https://strudel.cc/#" + quote(encoded, safe="")
 
 
 def parse_temp(value):
@@ -316,6 +381,7 @@ def main():
     p.add_argument("--png", action="store_true")
     p.add_argument("--no-push", action="store_true")
     p.add_argument("--copy", action="store_true")
+    p.add_argument("--no-open", action="store_true")
     args = p.parse_args()
 
     if args.pitch_map is not None:
@@ -350,22 +416,26 @@ def main():
         for mp_id in args.mp_ids
     ]
 
-    # index of everything exported so far (all runs), so you can see what's available
-    index = []
-    for f in sorted(p for p in DATA_DIR.glob("*.json") if p.name != "index.json"):
-        d = json.loads(f.read_text())
-        index.append(
-            {
-                "file": f.name,
-                "mp_id": d["mp_id"],
-                "temperature": d["temperature"],
-                "projection": d.get("projection"),
-                "labels": list(d.get("peaks", {})),
+    # index of everything exported so far (all runs), with the metadata the data files leave out.
+    # Entries from earlier runs are kept; entries for files that no longer exist are dropped.
+    index_path = DATA_DIR / "index.json"
+    try:
+        index = {e["file"]: e for e in json.loads(index_path.read_text())}
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+        index = {}
+    for m in materials:
+        for temp, path in m["files"].items():
+            index[path.name] = {
+                "file": path.name,
+                "mp_id": m["mp_id"],
+                "formula": m["formula"],
+                "temperature": temp,
+                "projection": m["projection"],
+                "labels": m["labels"],
+                "settings": m["settings"],
             }
-        )
-    (DATA_DIR / "index.json").write_text(
-        json.dumps(index, indent=1, ensure_ascii=False)
-    )
+    index = [e for name, e in sorted(index.items()) if (DATA_DIR / name).is_file()]
+    index_path.write_text(json.dumps(index, indent=1, ensure_ascii=False))
 
     paths = (
         [path for m in materials for path in m["files"].values()]
@@ -390,13 +460,23 @@ def main():
     base_url = f"https://raw.githubusercontent.com/{repo}/{ref}/{DATA_DIR.as_posix()}/"
     block = strudel_block(materials, base_url, f"{repo}@{ref[:7]}")
 
-    print("\n---------- paste into the top of strudel.cc ----------\n")
-    print(block)
-    print("\n-------------------------------------------------------")
+    # backup in case the browser doesn't open: overwritten on every run, never committed
+    url = strudel_url(block + "\n")
+    STRUDEL_FILE.write_text(
+        f"// link that opens strudel.cc with the code below already in the editor:\n// {url}\n\n"
+        f"// or paste this into the top of the strudel.cc editor:\n{block}\n"
+    )
 
     if args.copy:
         subprocess.run(["pbcopy"], input=block, text=True, check=True)
-        print("(copied to clipboard)")
+
+    if not args.no_open and not args.no_push:
+        webbrowser.open(url)
+        print(f"\nopened in Strudel (code and link also saved to {STRUDEL_FILE})")
+    else:
+        print(f"\nStrudel code and link saved to {STRUDEL_FILE}")
+    if args.copy:
+        print("(code copied to clipboard)")
 
 
 if __name__ == "__main__":
