@@ -20,11 +20,22 @@
  {
   "file": "C_mp66_element_600K.json",
   "mp_id": "mp-66",
+  "formula": "C",
   "temperature": 600,
   "projection": "element",
   "labels": [
    "C"
-  ]
+  ],
+  "settings": {
+   "n_peaks": 9,
+   "smoothing_THz": 0.3,
+   "min_frequency_THz": 0.0,
+   "pitch_map": {
+    "THz": 1.0,
+    "Hz": 116.41532182693481
+   },
+   "octaves_down": 33
+  }
  },
  {
   "file": "C_mp66_element_athermal.json",
