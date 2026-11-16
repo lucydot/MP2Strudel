@@ -1,0 +1,5 @@
+.env
+*_dos.json
+*_bs.json
+__pycache__/
+data/strudel_header.js
