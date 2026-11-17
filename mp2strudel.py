@@ -4,8 +4,8 @@ MP2Strudel workflow:
 
 1. Pull in data from Materials Project API
 2. Fit the phonon DOS with Gaussian peaks (SingingMaterials package)
-3. Push processed data as a JSON file to GitHub (data/<formula>_<mpid>_<projection>_<temp>.json, e.g. CaCO3_mp3953_element_300K.json)
-4. Print Strudel code that loads the JSON, to paste at the top of the `strudel.cc` editor.
+3. Write processed data as a JSON file to data/<formula>_<mpid>_<projection>_<temp>.json
+4. Embed the peak data in Strudel code and create a link that opens it in the editor.
 
 Example usage:
 
@@ -14,7 +14,7 @@ Example usage:
 
 Environment:
 
-This code must be run from inside a clone of a public GitHub repo, with MP_API_KEY in a .env file:
+This code can be run from any directory, with MP_API_KEY in a .env file:
 
 Options:
     --temps          "athermal" and/or temperatures in K (default: athermal)
@@ -23,21 +23,20 @@ Options:
     --smoothing      THz; one number, or LABEL=X pairs (default 0.3)
     --min-frequency  THz; leave the lowest frequencies out of the fit (default 0)
     --octaves-down   N; play the true phonon frequencies N octaves lower, i.e. divide by 2**N
-                     (default 33, which puts 1 THz at 116.4 Hz)
+                     (default 35, which puts 1 THz at 29.1 Hz)
     --pitch-map      THZ HZ; instead of --octaves-down, phonon frequency THZ sounds at HZ and every other
                      frequency is scaled by the same factor (e.g. 1 110 puts 1 THz on A2)
-    --png            also save a plot of each fit to plots/<same name>.png (committed with the data)
-    --no-push        write the files but skip git
+    --png            also save a plot of each fit to plots/<same name>.png
     --copy           also copy the Strudel block to the clipboard (macOS pbcopy)
-    --no-open        don't open the Strudel link in the browser (it is never opened with --no-push)
+    --no-open        don't open the Strudel link in the browser
 
 The Strudel code and a strudel.cc link that opens it are also written to strudel.js (overwritten each run).
+Peak data is embedded in the code and link, so neither Git nor hosted JSON files are needed to play it.
 """
 
 import argparse
 import base64
 import json
-import re
 import subprocess
 import webbrowser
 from pathlib import Path
@@ -49,8 +48,9 @@ from singingmaterials import frequency_mapping, mp_interface, peak_fitting
 DATA_DIR = Path("data")
 PLOT_DIR = Path("plots")
 STRUDEL_FILE = Path("strudel.js")  # latest Strudel code and link; overwritten each run
-DEFAULT_OCTAVES_DOWN = frequency_mapping.DEFAULT_OCTAVES_DOWN
-DEFAULT_PITCH_MAP = (  # (THz, Hz): 1 THz sounds at 116.4 Hz
+# two octaves below SingingMaterials' default (33), which sounded too high for stiff materials like diamond
+DEFAULT_OCTAVES_DOWN = frequency_mapping.DEFAULT_OCTAVES_DOWN + 2
+DEFAULT_PITCH_MAP = (  # (THz, Hz): 1 THz sounds at 29.1 Hz
     1.0,
     frequency_mapping.phonon_to_audible_octaves(1e12, DEFAULT_OCTAVES_DOWN),
 )
@@ -223,33 +223,6 @@ def export_material(
     }
 
 
-def git(*args):
-    return subprocess.run(
-        ["git", *args], check=True, capture_output=True, text=True
-    ).stdout.strip()
-
-
-def github_repo():
-    """'owner/repo' from the origin remote (https or ssh form)."""
-    url = git("remote", "get-url", "origin")
-    match = re.search(r"github\.com[:/](.+?)(?:\.git)?/?$", url)
-    if not match:
-        raise SystemExit(f"origin ({url}) is not a GitHub repo")
-    return match.group(1)
-
-
-def commit_and_push(paths, message):
-    git("add", *map(str, paths))
-    if git("diff", "--cached", "--name-only"):
-        git("commit", "-m", message)
-        print(git("log", "-1", "--oneline"))
-    else:
-        print("data unchanged, nothing to commit")
-    print("pushing...")
-    subprocess.run(["git", "push"], check=True)
-    return git("rev-parse", "HEAD")
-
-
 def short_names(materials):
     """short JS names for each (file, label) pair, e.g. C, or C_300K / CaCO3_C_300K when needed to keep
     them unique. Every name uses the same level of detail, so the block reads consistently."""
@@ -285,7 +258,7 @@ def describe_temp(temp):
     return "athermal" if temp is None else f"{temp:g} K"
 
 
-def strudel_block(materials, base_url, label):
+def strudel_block(materials, label):
     settings = materials[0][
         "settings"
     ]  # pitch settings are the same for every material in a run
@@ -297,7 +270,6 @@ def strudel_block(materials, base_url, label):
     lines = [
         f"// Singing Materials phonon peaks · {label}",
         f"// pitch: {pitch} (ratios kept)",
-        "const load = f => fetch('" + base_url + "' + f).then(r => r.json())",
     ]
     for m in materials:
         st = m["settings"]
@@ -310,9 +282,23 @@ def strudel_block(materials, base_url, label):
             f"min frequency {st['min_frequency_THz']:g} THz",
         ]
         for temp, path in m["files"].items():
-            lines.append(
-                f"const {path.stem} = await load('{path.name}')  // {describe_temp(temp)}"
-            )
+            peaks = {  # only what the Strudel code uses, to keep the link short
+                lab: {k: v[k] for k in ("freq", "width", "D")}
+                for lab, v in json.loads(path.read_text()).items()
+            }
+            # one line per list, so freq, width and D are easy to read in the editor
+            lines.append(f"const {path.stem} = {{  // {describe_temp(temp)}")
+            for lab, v in peaks.items():
+                # Strudel turns "double-quoted" strings into mini-notation patterns, so the key must
+                # be a bare name (C, Ca, O1) or 'single-quoted'
+                key = lab if lab.isidentifier() else "'" + lab.replace("'", "\\'") + "'"
+                lines.append(f"  {key}: {{")
+                lines += [
+                    f"    {k}: {json.dumps(vals, separators=(',', ':'))},"
+                    for k, vals in v.items()
+                ]
+                lines.append("  },")
+            lines.append("}")
 
     shorts = short_names(materials)
     lines += ["", "// shortcuts to each set of peaks"]
@@ -379,7 +365,6 @@ def main():
     )
     pitch.add_argument("--pitch-map", nargs=2, type=float, metavar=("THZ", "HZ"))
     p.add_argument("--png", action="store_true")
-    p.add_argument("--no-push", action="store_true")
     p.add_argument("--copy", action="store_true")
     p.add_argument("--no-open", action="store_true")
     args = p.parse_args()
@@ -437,30 +422,11 @@ def main():
     index = [e for name, e in sorted(index.items()) if (DATA_DIR / name).is_file()]
     index_path.write_text(json.dumps(index, indent=1, ensure_ascii=False))
 
-    paths = (
-        [path for m in materials for path in m["files"].values()]
-        + [DATA_DIR / "index.json"]
-        + [path for m in materials for path in m["plots"]]
-    )
-    if args.no_push:
-        repo, ref = "OWNER/REPO", "main"
-        try:
-            repo, ref = github_repo(), git("rev-parse", "--abbrev-ref", "HEAD")
-        except (subprocess.CalledProcessError, SystemExit, FileNotFoundError):
-            pass
-        print("\n--no-push: these links will only work once the files are pushed")
-    else:
-        repo = github_repo()
-        mats = ", ".join(f"{m['formula']} {m['mp_id']}" for m in materials)
-        ref = commit_and_push(
-            paths, f"phonon peaks: {mats} ({', '.join(map(temp_tag, temps))})"
-        )
+    mats = ", ".join(f"{m['formula']} {m['mp_id']}" for m in materials)
+    label = f"{mats} ({', '.join(map(temp_tag, temps))})"
+    block = strudel_block(materials, label)
 
-    # links pinned to the commit so we never get a stale cached copy
-    base_url = f"https://raw.githubusercontent.com/{repo}/{ref}/{DATA_DIR.as_posix()}/"
-    block = strudel_block(materials, base_url, f"{repo}@{ref[:7]}")
-
-    # backup in case the browser doesn't open: overwritten on every run, never committed
+    # backup in case the browser doesn't open: overwritten on every run
     url = strudel_url(block + "\n")
     STRUDEL_FILE.write_text(
         f"// link that opens strudel.cc with the code below already in the editor:\n// {url}\n\n"
@@ -470,7 +436,7 @@ def main():
     if args.copy:
         subprocess.run(["pbcopy"], input=block, text=True, check=True)
 
-    if not args.no_open and not args.no_push:
+    if not args.no_open:
         webbrowser.open(url)
         print(f"\nopened in Strudel (code and link also saved to {STRUDEL_FILE})")
     else:
